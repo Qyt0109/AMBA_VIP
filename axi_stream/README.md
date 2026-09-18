@@ -6,27 +6,35 @@ transactions to, a `ready_gen` for backpressure, and `set_delay()` on every beat
 
 Signal set is the simple one: **TDATA / TVALID / TREADY / TLAST**.
 
-## Files & compile order
+## Files
 
 ```
-axi4s_if.sv        # parameterized interface (compile first)
-axi4s_vip_pkg.sv   # the VIP package
+axi4s_vip_pkg.sv   # interface + package, one file
 tb_axi4s_vip.sv    # skid-buffer DUT + self-checking example
 ```
 
+`interface` cannot be declared inside `package ... endpackage`, so `axi4s_if`
+sits at file scope just above the package in the same file. Interface
+definitions are global to the design library, so the testbench can instantiate
+it and the package can declare `virtual axi4s_if #(...)` handles.
+
 ```bash
+# Vivado XSim
+xvlog -sv axi4s_vip_pkg.sv tb_axi4s_vip.sv
+xelab -debug typical -s tb_snap tb_axi4s_vip
+xsim tb_snap -R
+
 # Questa
-vlog -sv axi4s_if.sv axi4s_vip_pkg.sv tb_axi4s_vip.sv && vsim -c tb_axi4s_vip -do "run -all; quit"
+vlog -sv axi4s_vip_pkg.sv tb_axi4s_vip.sv && vsim -c tb_axi4s_vip -do "run -all; quit"
 # VCS
-vcs -sverilog -assert svaext axi4s_if.sv axi4s_vip_pkg.sv tb_axi4s_vip.sv && ./simv
+vcs -sverilog -assert svaext axi4s_vip_pkg.sv tb_axi4s_vip.sv && ./simv
 # Xcelium
-xrun -sv axi4s_if.sv axi4s_vip_pkg.sv tb_axi4s_vip.sv
+xrun -sv axi4s_vip_pkg.sv tb_axi4s_vip.sv
 ```
 
 Packages cannot be parameterized in SystemVerilog, so the width lives on the
-*classes* (`#(int DATA_WIDTH = 32)`) and on the interface, and each class holds a
-`virtual axi4s_if #(DATA_WIDTH)` handle. Instantiate any widths you like in the
-same testbench.
+*classes* (`#(int DATA_WIDTH = 32)`) and on the interface. Instantiate any
+widths you like in the same testbench.
 
 ## Quick start
 
@@ -60,25 +68,27 @@ end
 
 | Priority | How | Scope |
 |---|---|---|
-| 1 | `t.set_delay(n)` or `driver.send(t, .delay(n))` | that beat only |
-| 2 | `t.set_delay_cfg(cfg)` or `driver.send(t, .cfg(cfg))` | that beat, from a policy object |
+| 1 | `t.set_delay(n)` or `driver.send(t, n)` | that beat only |
+| 2 | `t.set_delay_cfg(cfg)` or `driver.send(t, -1, cfg)` | that beat, from a policy object |
 | 3 | `driver.set_delay_cfg(cfg)` / `set_delay_fixed()` / `set_delay_random()` | every beat with no override |
 
-Built-in policies via `axi4s_delay_cfg`:
+`axi4s_delay_cfg` is configured in place (no static factories — they crash
+xelab):
 
 ```systemverilog
-axi4s_delay_cfg::make_fixed(4);                          // always 4
-axi4s_delay_cfg::make_uniform(0, 7);                     // $urandom_range
-axi4s_delay_cfg::make_weighted(.pct_idle(30),.lo(1),.hi(6)); // 30% of beats gapped
-axi4s_delay_cfg::make_sequence('{0,0,5,1}, .repeat_list(1)); // walk a pattern
+axi4s_delay_cfg c = new();     // or new(AXI4S_DELAY_UNIFORM, 0, 7)
+c.set_fixed(4);                             // always 4
+c.set_uniform(0, 7);                        // $urandom_range
+c.set_weighted(.pct_idle(30), .lo(1), .hi(6)); // 30% of beats gapped
+c.set_sequence('{0, 0, 5, 1});              // walk a pattern (dynamic array)
 ```
 
-Anything else: extend the class, set mode `AXI4S_DELAY_CUSTOM`, override
-`user_delay(beat_index)`. `tb_axi4s_vip.sv` shows a `burst_gap_delay` that sends
-N beats back-to-back then inserts a fixed gap.
+Anything else: extend the class, pass `AXI4S_DELAY_CUSTOM` to `super.new()`, and
+override `user_delay(beat_index)`. `tb_axi4s_vip.sv` has a `burst_gap_delay`
+that sends N beats back-to-back then inserts a fixed gap.
 
-Randomization also works — `set_delay_range(lo,hi)` then `t.randomize()`;
-`post_randomize()` marks the delay as explicit so the driver uses it.
+Randomization also works — `set_delay_range(lo, hi)` then `t.randomize()`;
+`post_randomize()` marks the delay explicit so the driver uses it.
 
 ## Backpressure control
 
@@ -107,25 +117,42 @@ custom waveform — it is called once per ACLK and returns TREADY for the next c
 
 Both agents contain a passive `axi4s_monitor` sampling TVALID&&TREADY:
 
-* `monitor.beat_mb` — `mailbox` of `axi4s_transaction`
-* `monitor.pkt_mb`  — `mailbox` of `axi4s_packet` (TLAST-delimited, has `compare()`)
+* `monitor.get_beat(t)` / `monitor.get_packet(p)` — blocking, output arg
+* `monitor.beat_q[$]` / `monitor.pkt_q[$]` — the raw queues if you prefer polling
 * `monitor.write_beat()` / `write_packet()` — virtual hooks to plug a scoreboard into
 * `monitor.wait_beats(n)` / `wait_packets(n)`, `num_beats`, `num_packets`
 
-The slave driver additionally puts everything it accepts into `slv.driver.rx`.
+`axi4s_packet` has `compare()`, `size()` and `convert2string()`. The slave driver
+additionally pushes everything it accepts into `slv.driver.rx_q` (`get_beat()`).
 
-## Notes and limitations
+## Simulator-compatibility notes
 
-* Driver and monitor loops stay aligned to the clocking event, so back-to-back
-  beats have zero bubbles and handshake sampling is race-free (`input #1step`,
-  `output #0`).
-* On `aresetn` assertion the driver aborts the in-flight beat and (by default,
-  `drop_on_reset`) discards queued transactions. TVALID deasserts on the first
-  clock edge after reset, not combinationally.
+The following were deliberately avoided because Vivado `xelab` segfaults during
+elaboration on some of them:
+
+* static factory methods that construct their own class type
+* `typedef <own parameterized class> this_type;` inside that class
+* `disable fork` inside class tasks — every driver/monitor loop is instead
+  clock-aligned and polls ARESETN each edge, aborting an in-flight beat on reset
+* mailboxes and queue formal arguments in class methods — queues and dynamic
+  arrays are used instead
+
+If elaboration still faults, run `xelab --O0 -debug all` and bisect: `-O0`
+succeeding points at the optimizer rather than the source.
+
+## Other notes
+
+* Driver and monitor loops stay on the clocking event, so back-to-back beats have
+  zero bubbles and handshake sampling is race-free (`input #1step`, `output #0`).
+* On reset the driver aborts the in-flight beat and (by default, `drop_on_reset`)
+  discards queued transactions. TVALID deasserts on the first clock edge after
+  reset, not combinationally.
 * `set_verbosity(AXI4S_HIGH)` prints every beat; `AXI4S_MEDIUM` prints packets;
   `AXI4S_NONE` (default) is silent.
-* Protocol assertions live in the interface — compile with `+define+AXI4S_NO_PROTOCOL_CHECKS`
-  to drop them.
+* Protocol assertions live in the interface — compile with
+  `+define+AXI4S_NO_PROTOCOL_CHECKS` (xvlog: `-d AXI4S_NO_PROTOCOL_CHECKS`) to drop them.
+* Monitor queues grow unboundedly if nothing consumes them; in a long run either
+  drain them or clear `beat_q`/`pkt_q` periodically.
 * To add TKEEP/TSTRB/TID/TDEST/TUSER: add the signals to the interface and its
   clocking blocks, add fields plus `set_*`/`get_*` to `axi4s_transaction`, and
-  extend `drive_beat()` / `sample_loop()` — nothing else changes.
+  extend `drive_beat()` / the sampling branch of `axi4s_monitor::run()`.
